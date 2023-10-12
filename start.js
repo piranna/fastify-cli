@@ -3,32 +3,37 @@
 'use strict'
 
 require('dotenv').config()
-
-const assert = require('assert')
-const updateNotifier = require('update-notifier')
-const PinoColada = require('pino-colada')
-const pump = require('pump')
 const isDocker = require('is-docker')
+const closeWithGrace = require('close-with-grace')
+const deepmerge = require('@fastify/deepmerge')({
+  cloneProtoObject (obj) { return obj }
+})
+
 const listenAddressDocker = '0.0.0.0'
 const watch = require('./lib/watch')
 const parseArgs = require('./args')
-const { exit, requireFastifyForModule, requireServerPluginFromPath, showHelpForCommand } = require('./util')
+const {
+  exit,
+  requireModule,
+  requireFastifyForModule,
+  requireServerPluginFromPath,
+  showHelpForCommand,
+  isKubernetes
+} = require('./util')
 
 let Fastify = null
-let fastifyPackageJSON = null
 
 function loadModules (opts) {
   try {
-    const { module: fastifyModule, pkg: fastifyPkg } = requireFastifyForModule(opts._[0])
+    const { module: fastifyModule } = requireFastifyForModule(opts._[0])
 
     Fastify = fastifyModule
-    fastifyPackageJSON = fastifyPkg
   } catch (e) {
     module.exports.stop(e)
   }
 }
 
-function start (args, cb) {
+async function start (args) {
   const opts = parseArgs(args)
   if (opts.help) {
     return showHelpForCommand('start')
@@ -44,49 +49,63 @@ function start (args, cb) {
 
   loadModules(opts)
 
-  const notifier = updateNotifier({
-    pkg: {
-      name: 'fastify',
-      version: fastifyPackageJSON.version
-    },
-    updateCheckInterval: 1000 * 60 * 60 * 24 * 7 // 1 week
-  })
-
-  notifier.notify({
-    isGlobal: false,
-    defer: false
-  })
-
   if (opts.watch) {
-    return watch(args, opts.ignoreWatch)
+    return watch(args, opts.ignoreWatch, opts.verboseWatch)
   }
 
-  return runFastify(args, cb)
+  return runFastify(args)
 }
 
 function stop (message) {
   exit(message)
 }
 
-function runFastify (args, cb) {
+async function runFastify (args, additionalOptions, serverOptions) {
   const opts = parseArgs(args)
+  if (opts.require) {
+    if (typeof opts.require === 'string') {
+      opts.require = [opts.require]
+    }
+
+    try {
+      opts.require.forEach(module => {
+        if (module) {
+          /* This check ensures we ignore `-r ""`, trailing `-r`, or
+           * other silly things the user might (inadvertently) be doing.
+           */
+          requireModule(module)
+        }
+      })
+    } catch (e) {
+      module.exports.stop(e)
+    }
+  }
   opts.port = opts.port || process.env.PORT || 3000
-  cb = cb || assert.ifError
 
   loadModules(opts)
 
   let file = null
 
   try {
-    file = requireServerPluginFromPath(opts._[0])
+    file = await requireServerPluginFromPath(opts._[0])
   } catch (e) {
     return module.exports.stop(e)
   }
 
-  const options = {
-    logger: {
-      level: opts.logLevel
-    },
+  let logger
+  if (opts.loggingModule) {
+    try {
+      logger = requireModule(opts.loggingModule)
+    } catch (e) {
+      module.exports.stop(e)
+    }
+  }
+
+  const defaultLogger = {
+    level: opts.logLevel
+  }
+  let options = {
+    logger: logger || defaultLogger,
 
     pluginTimeout: opts.pluginTimeout
   }
@@ -96,32 +115,61 @@ function runFastify (args, cb) {
   }
 
   if (opts.prettyLogs) {
-    const pinoColada = PinoColada()
-    options.logger.stream = pinoColada
-    pump(pinoColada, process.stdout, assert.ifError)
+    options.logger.transport = {
+      target: 'pino-pretty'
+    }
   }
 
-  const fastify = Fastify(opts.options ? Object.assign(options, file.options) : options)
+  if (opts.debug) {
+    if (process.version.match(/v[0-6]\..*/g)) {
+      stop('Fastify debug mode not compatible with Node.js version < 6')
+    } else {
+      require('inspector').open(
+        opts.debugPort,
+        opts.debugHost || isDocker() || isKubernetes() ? listenAddressDocker : undefined
+      )
+    }
+  }
 
-  const pluginOptions = {}
+  if (serverOptions) {
+    options = deepmerge(options, serverOptions)
+  }
+
+  if (opts.options && file.options) {
+    options = deepmerge(options, file.options)
+  }
+
+  const fastify = Fastify(options)
+
   if (opts.prefix) {
-    pluginOptions.prefix = opts.prefix
+    opts.pluginOptions.prefix = opts.prefix
   }
 
-  fastify.register(file, pluginOptions)
+  const appConfig = Object.assign({}, opts.pluginOptions, additionalOptions)
+  await fastify.register(file.default || file, appConfig)
 
-  if (opts.address) {
-    fastify.listen(opts.port, opts.address, wrap)
+  const closeListeners = closeWithGrace({ delay: opts.closeGraceDelay }, async function ({ signal, err, manual }) {
+    if (err) {
+      fastify.log.error(err)
+    }
+    await fastify.close()
+  })
+
+  await fastify.addHook('onClose', (instance, done) => {
+    closeListeners.uninstall()
+    done()
+  })
+
+  if (additionalOptions && additionalOptions.ready) {
+    await fastify.ready()
+  } else if (opts.address) {
+    await fastify.listen({ port: opts.port, host: opts.address })
   } else if (opts.socket) {
-    fastify.listen(opts.socket, wrap)
-  } else if (isDocker()) {
-    fastify.listen(opts.port, listenAddressDocker, wrap)
+    await fastify.listen({ path: opts.socket })
+  } else if (isDocker() || isKubernetes()) {
+    await fastify.listen({ port: opts.port, host: listenAddressDocker })
   } else {
-    fastify.listen(opts.port, wrap)
-  }
-
-  function wrap (err) {
-    cb(err, fastify)
+    await fastify.listen({ port: opts.port })
   }
 
   return fastify

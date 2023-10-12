@@ -1,4 +1,6 @@
-Usage: fastify start [opts] <file>
+Usage: fastify start [opts] <file> [--] [<plugin-options>]
+
+OPTS
 
   -p, --port
   [env: FASTIFY_PORT or PORT]
@@ -16,6 +18,14 @@ Usage: fastify start [opts] <file>
   [env: FASTIFY_LOG_LEVEL]
       Log level (default to fatal)
 
+  -r, --require
+  [env: FASTIFY_REQUIRE]
+      Module to preload
+
+  -L, --logging-module
+  [env: FASTIFY_LOGGING_MODULE]
+      Path to logging configuration module to use
+
   -P, --pretty-logs
   [env: FASTIFY_PRETTY_LOGS]
       Prints pretty logs
@@ -28,7 +38,7 @@ Usage: fastify start [opts] <file>
   [env: FASTIFY_WATCH]
       Watch process.cwd() directory for changes, recursively; when that happens, the process will auto reload.
 
-  -r, --prefix
+  -x, --prefix
   [env: FASTIFY_PREFIX]
       Set the prefix
 
@@ -39,5 +49,24 @@ Usage: fastify start [opts] <file>
   -T, --plugin-timeout
       The maximum amount of time that a plugin can take to load (default to 10 seconds).
 
+  -g, --close-grace-delay
+      The maximum amount of time before forcefully closing pending requests (default to 500 ms)
+
+  -d, --debug
+      Start Fastify app in debug mode with nodejs inspector 
+
+  -I, --debug-port
+      Set the inspector port (default to 9320)
+
   -h, --help
       Show this help message
+
+Examples:
+
+  start plugin.js on port 8080
+
+    fastify start -p 8080 plugin.js
+
+  start plugin.js passing custom options to it
+
+    fastify start plugin.js -- --custom-plugin-option-1 --custom-plugin-option-2
